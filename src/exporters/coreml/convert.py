@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Mapping, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Mapping, Tuple, Union
 
 import coremltools as ct
 from coremltools.converters.mil.frontend.torch.torch_op_registry import _TORCH_OPS_REGISTRY
@@ -37,11 +37,7 @@ except ImportError:  # pragma: no cover
 from .config import CoreMLConfig
 from .quantization import (
     QuantizationConfig,
-    QuantizationMode,
     apply_post_training_quantization,
-    collect_coreml_calibration_samples,
-    collect_torch_calibration_samples,
-    prepare_torch_model_for_quantization,
     quantization_metadata,
     resolve_quantization_config,
 )
@@ -155,30 +151,6 @@ def export_pytorch(
 
     dummy_inputs = config.generate_dummy_inputs(preprocessor, framework=TensorType.PYTORCH)
 
-    calibration_samples: List[Mapping[str, np.ndarray]] = []
-    if quant_config.needs_coreml_calibration:
-        calibration_samples = collect_coreml_calibration_samples(
-            config,
-            preprocessor,
-            dummy_inputs,
-            quant_config.calibration_samples,
-            prompts_path=quant_config.calibration_prompts,
-        )
-
-    torch_calibration: Optional[List] = None
-    if quant_config.needs_torch_calibration:
-        torch_calibration = collect_torch_calibration_samples(
-            config,
-            preprocessor,
-            quant_config.calibration_samples,
-            prompts_path=quant_config.calibration_prompts,
-        )
-    else:
-        torch_calibration = []
-
-    if quant_config.mode in {QuantizationMode.GPTQ, QuantizationMode.QAT}:
-        prepare_torch_model_for_quantization(model, quant_config, torch_calibration)
-
     example_inputs = [dummy_inputs[key][0] for key in config.inputs.keys()]
 
     wrapper = Wrapper(model, config).eval()
@@ -219,11 +191,7 @@ def export_pytorch(
         **convert_kwargs,
     )
 
-    mlmodel = apply_post_training_quantization(
-        mlmodel,
-        quant_config,
-        calibration_data=calibration_samples,
-    )
+    mlmodel = apply_post_training_quantization(mlmodel, quant_config)
 
     for name, func in restore_ops.items():  # pragma: no cover
         if func is not None:

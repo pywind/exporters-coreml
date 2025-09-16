@@ -49,12 +49,6 @@ def convert_model(preprocessor, model, model_coreml_config, args, use_past: bool
         compute_units = ComputeUnit.CPU_AND_NE
 
     quant_config = resolve_quantization_config(args.quantize)
-    quant_config.calibration_samples = args.calibration_limit
-    quant_config.calibration_prompts = args.calibration_prompts
-    quant_config.gptq_block_size = args.gptq_block_size
-    if args.qat_checkpoint is not None:
-        quant_config.qat_checkpoint = args.qat_checkpoint
-
     mlmodel = export(
         preprocessor,
         model,
@@ -98,8 +92,8 @@ def main():
         type=str,
         default="float16",
         help=(
-            "Quantization strategy. Supported values include float32, float16, "
-            "rtn-int4, rtn-int8, activation-int8, gptq-int4 and qat-int8."
+            "Quantization precision to use for conversion. "
+            "Supported values include float32 and float16."
         ),
     )
     parser.add_argument(
@@ -108,30 +102,6 @@ def main():
         choices=["all", "cpu_and_gpu", "cpu_only", "cpu_and_ne"],
         default="all",
         help="Hardware units to optimise for during conversion.",
-    )
-    parser.add_argument(
-        "--calibration_prompts",
-        type=Path,
-        default=None,
-        help="Optional text file containing one prompt per line for calibration-aware quantization.",
-    )
-    parser.add_argument(
-        "--calibration_limit",
-        type=int,
-        default=128,
-        help="Maximum number of samples to draw when building calibration datasets.",
-    )
-    parser.add_argument(
-        "--gptq_block_size",
-        type=int,
-        default=128,
-        help="Block size to use for GPTQ quantization (only applicable to gptq-* modes).",
-    )
-    parser.add_argument(
-        "--qat_checkpoint",
-        type=Path,
-        default=None,
-        help="Path to a checkpoint produced via quantization-aware training (used for qat-* modes).",
     )
     parser.add_argument(
         "--preprocessor",

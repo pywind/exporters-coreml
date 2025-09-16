@@ -19,75 +19,51 @@ from __future__ import annotations
 import os
 import sys
 
-import numpy as np
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from exporters.coreml.quantization import (
-    QuantizationMode,
-    collect_coreml_calibration_samples,
-    collect_torch_calibration_samples,
+from exporters.coreml.quantization import (  # noqa: E402
+    QuantizationConfig,
+    apply_post_training_quantization,
     quantization_metadata,
     resolve_quantization_config,
 )
 
-from .test_coreml import DummyTokenizer, build_config
+
+class DummyModel:
+    pass
 
 
 def test_resolve_float_precision():
     config = resolve_quantization_config("float32")
-    assert config.mode is QuantizationMode.FLOAT
+    assert isinstance(config, QuantizationConfig)
     assert config.precision == "float32"
-    assert config.tag == "float32"
 
 
-def test_resolve_weight_quantization():
-    config = resolve_quantization_config("rtn-int4")
-    assert config.mode is QuantizationMode.WEIGHT_ONLY
-    assert config.weight_bits == 4
-    assert config.tag == "rtn-int4"
+def test_default_precision_is_float16():
+    config = resolve_quantization_config("float16")
+    assert config.precision == "float16"
 
 
-def test_resolve_activation_quantization():
-    config = resolve_quantization_config("activation-int8")
-    assert config.mode is QuantizationMode.ACTIVATION
-    assert config.activation_bits == 8
-    assert config.tag == "activation-int8"
-
-
-def test_collect_coreml_calibration_samples_uses_reference_shape():
-    coreml_config = build_config()
-    tokenizer = DummyTokenizer()
-    dummy_inputs = coreml_config.generate_dummy_inputs(tokenizer)
-    samples = collect_coreml_calibration_samples(
-        coreml_config,
-        tokenizer,
-        dummy_inputs,
-        sample_count=3,
-    )
-    assert len(samples) == 3
-    for sample in samples:
-        assert "input_ids" in sample
-        assert sample["input_ids"].dtype == np.int32
-
-
-@pytest.mark.skipif(True, reason="Torch is not available in the test environment")
-def test_collect_torch_calibration_samples_shapes():
-    coreml_config = build_config()
-    tokenizer = DummyTokenizer()
-    tensors = collect_torch_calibration_samples(
-        coreml_config,
-        tokenizer,
-        sample_count=2,
-    )
-    assert len(tensors) == 2
-    for tensor in tensors:
-        assert tensor.shape[0] == 1
-
-
-def test_quantization_metadata_contains_mode():
-    config = resolve_quantization_config("rtn-int8")
+@pytest.mark.parametrize("value", ["float32", "float16", "fp32", "fp16"])
+def test_metadata_contains_precision(value):
+    config = resolve_quantization_config(value)
     metadata = quantization_metadata(config)
-    assert metadata["co.huggingface.exporters.quantization.mode"] == QuantizationMode.WEIGHT_ONLY.value
-    assert metadata["co.huggingface.exporters.quantization.weight_bits"] == "8"
+    assert metadata["co.huggingface.exporters.precision"] == config.precision
+    assert metadata["co.huggingface.exporters.quantization"] == config.precision
+
+
+def test_apply_post_training_quantization_is_noop_without_coremltools(monkeypatch):
+    config = resolve_quantization_config("float16")
+
+    # Simulate absence of coremltools by forcing the module attribute to None.
+    monkeypatch.setattr("exporters.coreml.quantization.ct", None, raising=False)
+
+    model = DummyModel()
+    assert apply_post_training_quantization(model, config) is model
+
+
+def test_invalid_quantization_raises():
+    with pytest.raises(ValueError):
+        resolve_quantization_config("int8")
