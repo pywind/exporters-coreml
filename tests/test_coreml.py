@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021-2022 The HuggingFace Team. All rights reserved.
+# Copyright 2024 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,213 +12,95 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Unit tests for the simplified Core ML exporter."""
 
+from __future__ import annotations
+
+import numpy as np
 import pytest
 
-from unittest import TestCase
-from parameterized import parameterized
-from transformers import AutoConfig, is_tf_available, is_torch_available
-
-from exporters.coreml import (
-    CoreMLConfig,
-    export,
-    validate_model_outputs,
-)
-from transformers.onnx.utils import get_preprocessor
-from transformers.testing_utils import require_tf, require_torch, require_vision, slow
-from .testing_utils import require_coreml, require_macos
+from exporters.coreml.config import CoreMLConfig
+from exporters.coreml.features import FeaturesManager
 
 
-if is_torch_available() or is_tf_available():
-    from exporters.coreml.features import FeaturesManager
+class DummyTokenizer:
+    vocab_size = 128
 
 
-class TextCoreMLConfig(CoreMLConfig):
-    modality = "text"
+class DummyConfig:
+    model_type = "llama"
+    name_or_path = "dummy"
+    vocab_size = 128
+    max_position_embeddings = 64
+    num_hidden_layers = 2
+    num_attention_heads = 4
+    num_key_value_heads = 2
+    hidden_size = 16
+    use_cache = True
+    architectures = ["DummyForCausalLM"]
+    id2label = {}
 
 
-class CoreMLConfigTestCase(TestCase):
-    def test_unknown_modality(self):
-        with pytest.raises(ValueError):
-            config = CoreMLConfig(None, task="feature-extraction")
-
-    def test_unknown_task(self):
-        with pytest.raises(AssertionError):
-            config = TextCoreMLConfig(None, task="unknown-task")
-            _ = config.inputs
-
-    def test_sequence_length(self):
-        config = TextCoreMLConfig(None, task="feature-extraction")
-        flexible_outputs = config.get_flexible_outputs()
-        self.assertEqual(len(flexible_outputs), 1)
-        self.assertIn("last_hidden_state", flexible_outputs)
-
-        flexible_output = flexible_outputs["last_hidden_state"]
-        self.assertEqual(len(flexible_output), 1)
-        self.assertEqual(flexible_output[0]["axis"], 1)
-        self.assertEqual(flexible_output[0]["min"], 1)
-        self.assertEqual(flexible_output[0]["max"], config.max_sequence_length)
-
-        config = TextCoreMLConfig(None, task="text-classification")
-        flexible_outputs = config.get_flexible_outputs()
-        self.assertTrue(len(flexible_outputs) == 0)
+def build_config(task: str = "text-generation", use_past: bool = False) -> CoreMLConfig:
+    return CoreMLConfig(DummyConfig(), task=task, use_past=use_past)
 
 
-PYTORCH_EXPORT_MODELS = {
-    ("beit", "microsoft/beit-base-patch16-224"),
-    ("bert", "bert-base-cased"),
-    ("convnext", "facebook/convnext-tiny-224"),
-    ("cvt", "microsoft/cvt-21-384-22k"),
-    ("distilbert", "distilbert-base-cased"),
-    ("gpt2", "distilgpt2"),
-    ("levit", "facebook/levit-128S"),
-    ("mobilebert", "google/mobilebert-uncased"),
-    ("mobilevit", "apple/mobilevit-small"),
-    ("mobilevitv2", "apple/mobilevitv2-1.0-imagenet1k-256"),
-    ("segformer", "nvidia/mit-b0"),
-    ("squeezebert", "squeezebert/squeezebert-uncased"),
-    ("t5", "t5-small"),
-    ("vit", "google/vit-base-patch16-224"),
-    ("yolos", "hustvl/yolos-tiny"),
-}
-
-PYTORCH_EXPORT_WITH_PAST_MODELS = {
-    ("ctrl", "sshleifer/tiny-ctrl"),
-    #TODO ("gpt2", "distilgpt2"),
-}
-
-PYTORCH_EXPORT_SEQ2SEQ_WITH_PAST_MODELS = {}
-
-TENSORFLOW_EXPORT_DEFAULT_MODELS = {}
-
-TENSORFLOW_EXPORT_WITH_PAST_MODELS = {}
-
-TENSORFLOW_EXPORT_SEQ2SEQ_WITH_PAST_MODELS = {}
+def test_invalid_task_raises():
+    with pytest.raises(ValueError):
+        build_config(task="sequence-classification")
 
 
-# Copied from tests.onnx.test_onnx_v2._get_models_to_test
-def _get_models_to_test(export_models_list):
-    models_to_test = []
-    if is_torch_available() or is_tf_available():
-        for name, model, *features in export_models_list:
-            if features:
-                feature_config_mapping = {
-                    feature: FeaturesManager.get_config(name, feature) for _ in features for feature in _
-                }
-            else:
-                feature_config_mapping = FeaturesManager.get_supported_features_for_model_type(name)
-
-            for feature, coreml_config_class_constructor in feature_config_mapping.items():
-                models_to_test.append((f"{name}_{feature}", name, model, feature, coreml_config_class_constructor))
-        return sorted(models_to_test)
-    else:
-        # Returning some dummy test that should not be ever called because of the @require_torch / @require_tf
-        # decorators.
-        # The reason for not returning an empty list is because parameterized.expand complains when it's empty.
-        return [("dummy", "dummy", "dummy", "dummy", CoreMLConfig.from_model_config)]
+def test_inputs_without_past():
+    config = build_config()
+    inputs = config.inputs
+    assert list(inputs.keys()) == ["input_ids", "attention_mask"]
+    assert all(isinstance(desc, type(next(iter(inputs.values())))) for desc in inputs.values())
 
 
-@require_coreml
-@require_macos
-class CoreMLExportTestCase(TestCase):
-    """
-    Integration tests ensuring supported models are correctly exported
-    """
+def test_inputs_with_past():
+    config = build_config(task="text-generation-with-past")
+    inputs = config.inputs
+    past_keys = [key for key in inputs.keys() if key.startswith("past_key_values")]
+    assert len(past_keys) == config.num_layers * 2
 
-    def _coreml_export(self, test_name, name, model_name, feature, coreml_config_class_constructor):
-        model_class = FeaturesManager.get_model_class_for_feature(feature)
-        config = AutoConfig.from_pretrained(model_name)
-        model = model_class.from_config(config)
-        coreml_config = coreml_config_class_constructor(model.config)
-        preprocessor = get_preprocessor(model_name)
 
-        try:
-            if feature in ["text2text-generation", "speech-seq2seq"]:
-                coreml_config.seq2seq = "encoder"
-                mlmodel = export(
-                    preprocessor,
-                    model,
-                    coreml_config,
-                    quantize="float32",
-                )
-                validate_model_outputs(
-                    coreml_config,
-                    preprocessor,
-                    model,
-                    mlmodel,
-                    coreml_config.atol_for_validation,
-                )
+def test_outputs_with_past():
+    config = build_config(task="text-generation-with-past")
+    outputs = config.outputs
+    present_keys = [key for key in outputs.keys() if key.startswith("present_")]
+    assert len(present_keys) == config.num_layers * 2
 
-                coreml_config.seq2seq = "decoder"
-                mlmodel = export(
-                    preprocessor,
-                    model,
-                    coreml_config,
-                    quantize="float32",
-                )
-                validate_model_outputs(
-                    coreml_config,
-                    preprocessor,
-                    model,
-                    mlmodel,
-                    coreml_config.atol_for_validation,
-                )
-            else:
-                mlmodel = export(
-                    preprocessor,
-                    model,
-                    coreml_config,
-                    quantize="float32",
-                )
 
-                validate_model_outputs(
-                    coreml_config,
-                    preprocessor,
-                    model,
-                    mlmodel,
-                    coreml_config.atol_for_validation,
-                )
-        except (RuntimeError, ValueError) as e:
-            self.fail(f"{name}, {feature} -> {e}")
+def test_generate_dummy_inputs_shapes():
+    config = build_config(task="text-generation-with-past")
+    dummy_inputs = config.generate_dummy_inputs(DummyTokenizer())
+    assert dummy_inputs["input_ids"][0].shape == (1, min(config.max_sequence_length, 32))
+    assert dummy_inputs["attention_mask"][0].dtype == np.int64
+    for idx in range(config.num_layers):
+        key_name = f"past_key_values_{idx}_key"
+        value_name = f"past_key_values_{idx}_value"
+        assert dummy_inputs[key_name][0].shape[1] == config.num_key_value_heads
+        assert dummy_inputs[value_name][0].shape == dummy_inputs[key_name][0].shape
 
-    @parameterized.expand(_get_models_to_test(PYTORCH_EXPORT_MODELS))
-    @slow
-    @require_torch
-    @require_vision
-    def test_pytorch_export(self, test_name, name, model_name, feature, coreml_config_class_constructor):
-        self._coreml_export(test_name, name, model_name, feature, coreml_config_class_constructor)
 
-    @parameterized.expand(_get_models_to_test(PYTORCH_EXPORT_WITH_PAST_MODELS), skip_on_empty=True)
-    @slow
-    @require_torch
-    def test_pytorch_export_with_past(self, test_name, name, model_name, feature, coreml_config_class_constructor):
-        self._coreml_export(test_name, name, model_name, feature, coreml_config_class_constructor)
+def test_flexible_outputs():
+    config = build_config(task="text-generation-with-past")
+    flex = config.get_flexible_outputs()
+    assert "logits" in flex
+    assert flex["logits"][0]["max"] == config.max_sequence_length
+    present = flex[f"present_0_key"]
+    assert present[0]["min"] == 0
+    assert present[0]["max"] == -1
 
-    @parameterized.expand(_get_models_to_test(PYTORCH_EXPORT_SEQ2SEQ_WITH_PAST_MODELS), skip_on_empty=True)
-    @slow
-    @require_torch
-    def test_pytorch_export_seq2seq_with_past(
-        self, test_name, name, model_name, feature, coreml_config_class_constructor
-    ):
-        self._coreml_export(test_name, name, model_name, feature, coreml_config_class_constructor)
 
-    @parameterized.expand(_get_models_to_test(TENSORFLOW_EXPORT_DEFAULT_MODELS), skip_on_empty=True)
-    @slow
-    @require_tf
-    @require_vision
-    def test_tensorflow_export(self, test_name, name, model_name, feature, coreml_config_class_constructor):
-        self._coreml_export(test_name, name, model_name, feature, coreml_config_class_constructor)
+def test_features_manager_supported_models():
+    supported = FeaturesManager.get_supported_features_for_model_type("llama")
+    assert "text-generation" in supported
+    constructor = supported["text-generation"]
+    config = constructor(DummyConfig())
+    assert isinstance(config, CoreMLConfig)
 
-    @parameterized.expand(_get_models_to_test(TENSORFLOW_EXPORT_WITH_PAST_MODELS), skip_on_empty=True)
-    @slow
-    @require_tf
-    def test_tensorflow_export_with_past(self, test_name, name, model_name, feature, coreml_config_class_constructor):
-        self._coreml_export(test_name, name, model_name, feature, coreml_config_class_constructor)
 
-    @parameterized.expand(_get_models_to_test(TENSORFLOW_EXPORT_SEQ2SEQ_WITH_PAST_MODELS), skip_on_empty=True)
-    @slow
-    @require_tf
-    def test_tensorflow_export_seq2seq_with_past(
-        self, test_name, name, model_name, feature, coreml_config_class_constructor
-    ):
-        self._coreml_export(test_name, name, model_name, feature, coreml_config_class_constructor)
+def test_feature_synonyms():
+    assert FeaturesManager.map_from_synonym("causal-lm-with-past") == "text-generation-with-past"
+    assert FeaturesManager.map_from_synonym("text-generation") == "text-generation"

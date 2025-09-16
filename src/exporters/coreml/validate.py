@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2022 The HuggingFace Team. All rights reserved.
+# Copyright 2024 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,214 +12,117 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Validation utilities for the Core ML exporter."""
 
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Tuple, Union
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Tuple, Union
 
 import coremltools as ct
 import numpy as np
 
-from transformers.utils import TensorType, is_torch_available
-from transformers.modeling_utils import PreTrainedModel
+try:  # pragma: no cover - optional dependency
+    from transformers.utils import TensorType, is_torch_available
+except ImportError:  # pragma: no cover
+    from enum import Enum
+
+    class TensorType(Enum):
+        PYTORCH = "pt"
+        TENSORFLOW = "tf"
+
+    def is_torch_available() -> bool:
+        return False
 
 from .config import CoreMLConfig
 from ..utils import logging
 
 
-logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+if TYPE_CHECKING:  # pragma: no cover - type checking only
+    from transformers.feature_extraction_utils import FeatureExtractionMixin
+    from transformers.processing_utils import ProcessorMixin
+    from transformers.tokenization_utils import PreTrainedTokenizer
+    from transformers.modeling_utils import PreTrainedModel
 
 
-def softmax(x, axis=-1):
-    maxes = np.max(x, axis=axis, keepdims=True)
-    shifted_exp = np.exp(x - maxes)
-    return shifted_exp / shifted_exp.sum(axis=axis, keepdims=True)
+logger = logging.get_logger(__name__)
+
+
+def _numpy(value) -> np.ndarray:
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    return np.asarray(value)
 
 
 def validate_model_outputs(
     config: CoreMLConfig,
     preprocessor: Union["PreTrainedTokenizer", "FeatureExtractionMixin", "ProcessorMixin"],
-    reference_model: Union["PreTrainedModel", "TFPreTrainedModel"],
+    reference_model: "PreTrainedModel",
     mlmodel: ct.models.MLModel,
     atol: float,
-):
-    """
-    Validate that the outputs from the base and exported model agree within some absolute tolerance.
+) -> None:
+    if not is_torch_available():  # pragma: no cover
+        raise RuntimeError("Validation requires PyTorch to be installed")
 
-    Args:
-        config ([`~coreml.config.CoreMLConfig`]):
-            The Core ML configuration associated with the exported model.
-        preprocessor ([`PreTrainedTokenizer`], [`FeatureExtractionMixin`] or [`ProcessorMixin`]):
-            The preprocessor used for encoding the data.
-        reference_model ([`PreTrainedModel`] or [`TFPreTrainedModel`]):
-            The model to export.
-        mlmodel (`ct.models.MLModel`):
-            The exported Core ML model.
-        atol (`float`):
-            Absolute tolerance. Differences larger than this value are considered problematic.
-    """
+    from transformers.modeling_utils import PreTrainedModel as HFPreTrainedModel
+
+    if not isinstance(reference_model, HFPreTrainedModel):  # pragma: no cover
+        raise ValueError("Validation expects a PyTorch PreTrainedModel")
+
     logger.info("Validating Core ML model...")
 
-    input_descs = config.inputs
-    output_descs = config.outputs
+    dummy_inputs = config.generate_dummy_inputs(preprocessor, framework=TensorType.PYTORCH)
 
-    if is_torch_available() and issubclass(type(reference_model), PreTrainedModel):
-        framework = TensorType.PYTORCH
-    else:
-        framework = TensorType.TENSORFLOW
+    reference_inputs: Dict[str, object] = {}
+    past_key_values: List[List[object]] = []
+    coreml_inputs: Dict[str, object] = {}
 
-    dummy_inputs = config.generate_dummy_inputs(preprocessor, framework)
-
-    reference_model_inputs = {}
-    past_key_values = []
-    coreml_inputs = {}
-
-    # Put the dummy inputs into Core ML and reference model input dictionaries.
-    # The separate past_key_values inputs are combined into a tuple of tuples.
-    for name in input_descs.keys():
-        ref_value, coreml_value = dummy_inputs[name]
-        if name.startswith("past_key_values_"):
-            if name.endswith("_key"):
-                past_key_values.append((ref_value,))
-            else:
-                past_key_values[-1] += (ref_value,)
-        elif name == "encoder_outputs":
-            reference_model_inputs[name] = (ref_value,)
+    for name, desc in config.inputs.items():
+        reference_value, coreml_value = dummy_inputs[name]
+        if name.startswith("past_key_values"):
+            layer_index = int(name.split("_")[3])
+            while len(past_key_values) <= layer_index:
+                past_key_values.append([])
+            past_key_values[layer_index].append(reference_value)
         else:
-            reference_model_inputs[name] = ref_value
-        coreml_inputs[input_descs[name].name] = coreml_value
+            reference_inputs[name] = reference_value
+        coreml_inputs[desc.name] = coreml_value
 
-    if len(past_key_values) > 0:
-        reference_model_inputs["past_key_values"] = past_key_values
+    if past_key_values:
+        reference_inputs["past_key_values"] = [tuple(layer) for layer in past_key_values]
 
-    # Compute outputs from the reference model
-    if is_torch_available() and issubclass(type(reference_model), PreTrainedModel):
-        reference_model.to("cpu").eval()
-    if config.seq2seq == "encoder":
-        reference_model = reference_model.get_encoder()
-    ref_outputs_dict = reference_model(**reference_model_inputs, return_dict=True)
+    import torch
 
-    # Unpack the past_key_values output into separate outputs, as that is also
-    # how the Core ML mdel does it.
-    if "past_key_values" in ref_outputs_dict:
-        for i in range(len(ref_outputs_dict["past_key_values"])):
-            ref_outputs_dict[f"present_{i}_key"] = ref_outputs_dict["past_key_values"][i][0]
-            ref_outputs_dict[f"present_{i}_value"] = ref_outputs_dict["past_key_values"][i][1]
+    reference_model = reference_model.to("cpu").eval()
+    with torch.no_grad():
+        reference_outputs = reference_model(**reference_inputs, return_dict=True)
 
-    # Compute outputs from the Core ML model
+    if "past_key_values" in reference_outputs:
+        for idx, (key, value) in enumerate(reference_outputs["past_key_values"]):
+            reference_outputs[f"present_{idx}_key"] = key
+            reference_outputs[f"present_{idx}_value"] = value
+
     coreml_outputs = mlmodel.predict(coreml_inputs)
 
-    # Map the Core ML output names back to the names used by the reference model
-    coreml_output_names = list(coreml_outputs.keys())
-    coreml_output_internal_names = []
-    for name, desc in output_descs.items():
-        if desc.name in coreml_output_names:
-            coreml_output_internal_names.append(name)
+    for name, desc in config.outputs.items():
+        if desc.name not in coreml_outputs:
+            logger.warning(f"Core ML output '{desc.name}' missing from prediction results")
+            continue
 
-    spec = mlmodel._spec
+        coreml_value = _numpy(coreml_outputs[desc.name])
+        reference_value = _numpy(reference_outputs[name])
 
-    # Classifier models are special in Core ML
-    if config.is_classifier:
-        logger.info("\t- Core ML model is classifier, validating output")
-
-        if is_torch_available() and issubclass(type(reference_model), PreTrainedModel):
-            ref_logits = ref_outputs_dict["logits"].detach().numpy()
-        else:
-            ref_logits = ref_outputs_dict["logits"].numpy()
-
-        labels_name = spec.description.predictedFeatureName
-        coreml_value = coreml_outputs[labels_name]
-
-        ref_value = reference_model.config.id2label[np.argmax(ref_logits, axis=-1)[0]]
-        if coreml_value != ref_value:
-            logger.info(f"\t\t-[x] predicted class '{coreml_value}' doesn't match '{ref_value}'")
+        if coreml_value.shape != reference_value.shape:
             raise ValueError(
-                "Predicted class doesn't match between reference model and Core ML exported model: "
-                f"Got {ref_value} (reference) and {coreml_value} (Core ML)"
+                f"Output '{name}' shape mismatch: Core ML {coreml_value.shape} vs reference {reference_value.shape}"
             )
-        else:
-            logger.info(f"\t\t-[✓] predicted class '{coreml_value}' matches '{ref_value}'")
 
-        probs_name = spec.description.predictedProbabilitiesName
-        coreml_value = coreml_outputs[probs_name]
-        ref_value = softmax(ref_logits, axis=-1)[0]
+        if not np.allclose(coreml_value, reference_value, atol=atol):
+            max_diff = np.max(np.abs(coreml_value - reference_value))
+            raise ValueError(f"Output '{name}' differs more than allowed tolerance (max diff={max_diff})")
 
-        # Shape
-        if len(coreml_value) != len(ref_value):
-            logger.info(f"\t\t-[x] number of classes {len(coreml_value)} doesn't match {len(ref_value)}")
-            raise ValueError(
-                "Output shape doesn't match between reference model and Core ML exported model: "
-                f"Got {len(ref_value)} (reference) and {len(coreml_value)} (Core ML)"
-            )
-        else:
-            logger.info(f"\t\t-[✓] number of classes {len(coreml_value)} matches {len(ref_value)}")
+    logger.info("All good, Core ML model outputs match the reference model")
 
-        # Core ML probabilities are in a dict, put in sorted list for comparing
-        class_labels = config.get_class_labels()
-        coreml_probs = np.zeros_like(ref_value)
-        for i in range(len(ref_value)):
-            coreml_probs[i] = coreml_value[class_labels[i]]
 
-        # Values
-        if not np.allclose(ref_value, coreml_probs, atol=atol):
-            logger.info(f"\t\t-[x] values not close enough (atol: {atol})")
-            raise ValueError(
-                "Output values do not match between reference model and Core ML exported model: "
-                f"Got max absolute difference of: {np.amax(np.abs(ref_value - coreml_probs))}"
-            )
-        else:
-            logger.info(f"\t\t-[✓] all values close (atol: {atol})")
-
-        return
-
-    # Check that keys in coreml_output_internal are a subset of keys from ref_outputs
-    ref_outputs_set = set(ref_outputs_dict.keys())
-    coreml_outputs_set = set(coreml_output_internal_names)
-    if not coreml_outputs_set.issubset(ref_outputs_set):
-        logger.info(
-            f"\t-[x] Core ML model output names {coreml_outputs_set} do not match reference model {ref_outputs_set}"
-        )
-        raise ValueError(
-            "Output names do not match between reference model and Core ML exported model: "
-            f"{coreml_outputs_set.difference(ref_outputs_set)}"
-        )
-    else:
-        logger.info(f"\t-[✓] Core ML model output names match reference model ({coreml_outputs_set})")
-
-    # Check the shape and values match
-    for name in coreml_output_internal_names:
-        coreml_name = output_descs[name].name
-        coreml_value = coreml_outputs[coreml_name]
-
-        if is_torch_available() and issubclass(type(reference_model), PreTrainedModel):
-            ref_value = ref_outputs_dict[name].detach().numpy()
-        else:
-            ref_value = ref_outputs_dict[name].numpy()
-
-        if output_descs[name].do_softmax:
-            axis = 1 if config.task == "semantic-segmentation" else -1
-            ref_value = softmax(ref_value, axis=axis)
-
-        logger.info(f'\t- Validating Core ML model output "{name}":')
-
-        # Shape
-        if not coreml_value.shape == ref_value.shape:
-            if config.task == "semantic-segmentation" and (output_descs[name].do_upsample or output_descs[name].do_argmax):
-                logger.info("\t\t-[ ] cannot compare outputs because of do_upsample or do_argmax options")
-                continue
-            else:
-                logger.info(f"\t\t-[x] shape {coreml_value.shape} doesn't match {ref_value.shape}")
-                raise ValueError(
-                    "Output shape doesn't match between reference model and Core ML exported model: "
-                    f"Got {ref_value.shape} (reference) and {coreml_value.shape} (Core ML)"
-                )
-        else:
-            logger.info(f"\t\t-[✓] {coreml_value.shape} matches {ref_value.shape}")
-
-        # Values
-        if not np.allclose(ref_value, coreml_value, atol=atol):
-            logger.info(f"\t\t-[x] values not close enough (atol: {atol})")
-            raise ValueError(
-                "Output values do not match between reference model and Core ML exported model: "
-                f"Got max absolute difference of: {np.amax(np.abs(ref_value - coreml_value))}"
-            )
-        else:
-            logger.info(f"\t\t-[✓] all values close (atol: {atol})")
+__all__ = ["validate_model_outputs"]
