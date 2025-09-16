@@ -25,6 +25,7 @@ This repository focuses on exporting PyTorch-based large language models from ðŸ
 * Ready-made Core ML configurations for popular decoder-only architectures such as **Llama**, **Mistral**, **Qwen/Qwen2**, **Phi-3**, and **GPT-2**.
 * Support for **key/value cache** inputs and outputs to unlock fast autoregressive decoding.
 * Built-in selection of Core ML **compute units**, allowing exports optimised for ANE acceleration (`ComputeUnit.ALL` or `ComputeUnit.CPU_AND_NE`).
+* End-to-end hooks for **post-training quantization** workflows, including round-to-nearest weight compression, activation-aware calibration, GPTQ, and integration with quantization-aware training checkpoints.
 * Simplified configuration classes that mirror the latest ðŸ¤— Transformers APIs.
 
 ## Installation
@@ -47,13 +48,32 @@ The `exporters.coreml` package can be used from the command line. The example be
 python -m exporters.coreml \
   --model meta-llama/Llama-2-7b-hf \
   --feature text-generation-with-past \
-  --quantize float16 \
+  --quantize rtn-int4 \
   --compute_units cpu_and_ne \
   --use_past \
   exported/
 ```
 
 The command downloads the PyTorch checkpoint, traces it with TorchScript, and converts the traced module to Core ML. The resulting package is saved as `exported/Model.mlpackage` unless a different filename is provided. If the conversion runs on macOS 12 or later, a validation step compares the Core ML outputs to the original PyTorch model.
+
+### Quantization strategies
+
+The `--quantize` flag controls both the Core ML compute precision and the post-processing applied to the exported model:
+
+| Mode | Description | Suggested extras |
+|------|-------------|------------------|
+| `float16` / `float32` | Disable additional compression and serialise weights directly in float precision. | None |
+| `rtn-int4` / `rtn-int8` | Apply round-to-nearest post-training weight quantization (data-free). | None |
+| `activation-int8` | Calibrate activations with sample data and compress runtime tensors to int8. | Provide prompts via `--calibration_prompts` or increase `--calibration_limit`. |
+| `gptq-int4` | Run GPTQ on the PyTorch model before export and emit a 4-bit weight-only Core ML package. | Optional calibration data via `--calibration_prompts`, adjust `--gptq_block_size` for large models. |
+| `qat-int8` | Consume a quantization-aware training checkpoint and quantize the Core ML weights. | Point `--qat_checkpoint` to the fine-tuned state dict. |
+
+Data-aware modes support additional options:
+
+* `--calibration_prompts`: text file with one prompt per line used to build calibration batches.
+* `--calibration_limit`: number of samples to synthesise when calibrating activations or GPTQ.
+* `--gptq_block_size`: block size for GPTQ compression (defaults to 128).
+* `--qat_checkpoint`: checkpoint path containing weights produced after quantization-aware fine-tuning.
 
 ### Feature selection
 
