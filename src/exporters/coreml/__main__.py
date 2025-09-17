@@ -30,6 +30,7 @@ from transformers.onnx.utils import get_preprocessor
 from .convert import export
 from .features import FeaturesManager
 from .validate import validate_model_outputs
+from .quantization import resolve_quantization_config, resolve_weight_compression_config
 from ..utils import logging
 
 
@@ -47,11 +48,20 @@ def convert_model(preprocessor, model, model_coreml_config, args, use_past: bool
     elif args.compute_units == "cpu_and_ne":
         compute_units = ComputeUnit.CPU_AND_NE
 
+    compression_config = resolve_weight_compression_config(
+        args.compress_weights,
+        mode=args.compression_mode,
+        nbits=args.compression_nbits,
+        threshold=args.compression_threshold,
+        target_percentile=args.compression_target_percentile,
+        min_elements=args.compression_min_const_size,
+    )
+    quant_config = resolve_quantization_config(args.quantize, weight_compression=compression_config)
     mlmodel = export(
         preprocessor,
         model,
         coreml_config,
-        quantize=args.quantize,
+        quantize=quant_config,
         compute_units=compute_units,
     )
 
@@ -88,9 +98,55 @@ def main():
     parser.add_argument(
         "--quantize",
         type=str,
-        choices=["float32", "float16"],
         default="float16",
-        help="Precision to use when serialising weights.",
+        help=(
+            "Quantization precision to use for conversion. "
+            "Supported values include float32 and float16."
+        ),
+    )
+    parser.add_argument(
+        "--compress-weights",
+        type=str,
+        default=None,
+        help=(
+            "Optional Core ML weight compression method to run post-conversion. "
+            "Supports 'affine', 'palettize', 'sparsify' or leave unset to skip."
+        ),
+    )
+    parser.add_argument(
+        "--compression-mode",
+        type=str,
+        default=None,
+        help=(
+            "Mode argument forwarded to the weight compression utility. "
+            "Refer to the Core ML Tools documentation for available values."
+        ),
+    )
+    parser.add_argument(
+        "--compression-nbits",
+        type=int,
+        default=None,
+        help="Palette bitwidth when using 'palettize' weight compression (1, 2, 4, 6, 8).",
+    )
+    parser.add_argument(
+        "--compression-threshold",
+        type=float,
+        default=None,
+        help="Magnitude threshold for 'sparsify' in 'threshold_based' mode.",
+    )
+    parser.add_argument(
+        "--compression-target-percentile",
+        type=float,
+        default=None,
+        help="Target percentile (0-1) for 'sparsify' in 'percentile_based' mode.",
+    )
+    parser.add_argument(
+        "--compression-min-const-size",
+        type=int,
+        default=None,
+        help=(
+            "Override the default constant size filter for compression by requiring at least this many elements."
+        ),
     )
     parser.add_argument(
         "--compute_units",

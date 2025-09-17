@@ -35,6 +35,12 @@ except ImportError:  # pragma: no cover
         return False
 
 from .config import CoreMLConfig
+from .quantization import (
+    QuantizationConfig,
+    apply_post_training_quantization,
+    quantization_metadata,
+    resolve_quantization_config,
+)
 from ..utils import logging
 
 
@@ -122,7 +128,7 @@ def export_pytorch(
     preprocessor: Union["PreTrainedTokenizer", "FeatureExtractionMixin", "ProcessorMixin"],
     model: "PreTrainedModel",
     config: CoreMLConfig,
-    quantize: str = "float16",
+    quantize: Union[str, QuantizationConfig] = "float16",
     compute_units: ct.ComputeUnit = ct.ComputeUnit.ALL,
 ) -> ct.models.MLModel:
     if not is_torch_available():  # pragma: no cover
@@ -141,7 +147,10 @@ def export_pytorch(
             logger.info(f"Overriding {key} -> {value}")
             setattr(model.config, key, value)
 
+    quant_config = resolve_quantization_config(quantize)
+
     dummy_inputs = config.generate_dummy_inputs(preprocessor, framework=TensorType.PYTORCH)
+
     example_inputs = [dummy_inputs[key][0] for key in config.inputs.keys()]
 
     wrapper = Wrapper(model, config).eval()
@@ -159,7 +168,7 @@ def export_pytorch(
         numpy_outputs = [outputs.detach().cpu().numpy()]
 
     convert_kwargs = {
-        "compute_precision": ct.precision.FLOAT16 if quantize == "float16" else ct.precision.FLOAT32,
+        "compute_precision": quant_config.coreml_compute_precision,
     }
 
     input_tensors = get_input_types(config, dummy_inputs)
@@ -182,6 +191,8 @@ def export_pytorch(
         **convert_kwargs,
     )
 
+    mlmodel = apply_post_training_quantization(mlmodel, quant_config)
+
     for name, func in restore_ops.items():  # pragma: no cover
         if func is not None:
             _TORCH_OPS_REGISTRY[name] = func
@@ -194,10 +205,8 @@ def export_pytorch(
             ct.utils.rename_feature(spec, spec.description.output[index].name, output_desc.name, rename_inputs=False)
             mlmodel.output_description[output_desc.name] = output_desc.description
 
-    user_metadata = {
-        "co.huggingface.exporters.task": config.task,
-        "co.huggingface.exporters.precision": quantize,
-    }
+    user_metadata = quantization_metadata(quant_config)
+    user_metadata["co.huggingface.exporters.task"] = config.task
     if hasattr(model.config, "architectures") and model.config.architectures:
         user_metadata["co.huggingface.exporters.architecture"] = model.config.architectures[0]
     if getattr(model.config, "transformers_version", None):
@@ -215,7 +224,7 @@ def export(
     preprocessor: Union["PreTrainedTokenizer", "FeatureExtractionMixin", "ProcessorMixin"],
     model: "PreTrainedModel",
     config: CoreMLConfig,
-    quantize: str = "float16",
+    quantize: Union[str, QuantizationConfig] = "float16",
     compute_units: ct.ComputeUnit = ct.ComputeUnit.ALL,
 ) -> ct.models.MLModel:
     if not is_torch_available():  # pragma: no cover

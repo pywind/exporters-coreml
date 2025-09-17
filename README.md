@@ -25,6 +25,7 @@ This repository focuses on exporting PyTorch-based large language models from ðŸ
 * Ready-made Core ML configurations for popular decoder-only architectures such as **Llama**, **Mistral**, **Qwen/Qwen2**, **Phi-3**, and **GPT-2**.
 * Support for **key/value cache** inputs and outputs to unlock fast autoregressive decoding.
 * Built-in selection of Core ML **compute units**, allowing exports optimised for ANE acceleration (`ComputeUnit.ALL` or `ComputeUnit.CPU_AND_NE`).
+* Control over the Core ML **compute precision** (float16 or float32) to balance model size and numerical fidelity.
 * Simplified configuration classes that mirror the latest ðŸ¤— Transformers APIs.
 
 ## Installation
@@ -41,7 +42,7 @@ The exporter requires Python 3.9+, [PyTorch](https://pytorch.org) and the latest
 
 ## Exporting a model
 
-The `exporters.coreml` package can be used from the command line. The example below exports a quantised Llama checkpoint with key/value caches enabled:
+The `exporters.coreml` package can be used from the command line. The example below exports a float16 Llama checkpoint with key/value caches enabled:
 
 ```bash
 python -m exporters.coreml \
@@ -54,6 +55,18 @@ python -m exporters.coreml \
 ```
 
 The command downloads the PyTorch checkpoint, traces it with TorchScript, and converts the traced module to Core ML. The resulting package is saved as `exported/Model.mlpackage` unless a different filename is provided. If the conversion runs on macOS 12 or later, a validation step compares the Core ML outputs to the original PyTorch model.
+
+### Quantization and weight compression
+
+The `--quantize` flag selects the Core ML compute precision used during conversion. Supported values are `float16` (default) and `float32`. These modes keep the computation in floating point and the exporter skips additional post-training quantization passes.
+
+To reduce the storage footprint without altering compute precision you can chain Core ML Tools' [weight compression utilities](https://coremltools.readme.io/v6.3/docs/compressing-ml-program-weights) via the `--compress-weights` flag:
+
+* `--compress-weights affine` applies affine (linear) quantization to emit 8-bit weights. Combine with `--compression-mode linear` or rely on the default symmetric interpolation.
+* `--compress-weights palettize --compression-nbits 4` replaces constants with lookup tables. The `--compression-mode` switch accepts `uniform`, `kmeans`, or `unique` to control how the palette is constructed.
+* `--compress-weights sparsify` stores sparse tensors compactly. Use `--compression-mode threshold_based --compression-threshold 0.01` or `--compression-mode percentile_based --compression-target-percentile 0.75` depending on whether you want a magnitude or percentile rule.
+
+All compression methods honour `--compression-min-const-size` so you can override the default behaviour and only process weights above a given element count. The exporter forwards these options directly to `coremltools.compression_utils` and records the chosen settings in the Core ML model metadata for downstream tooling.
 
 ### Feature selection
 
