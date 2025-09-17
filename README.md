@@ -56,9 +56,17 @@ python -m exporters.coreml \
 
 The command downloads the PyTorch checkpoint, traces it with TorchScript, and converts the traced module to Core ML. The resulting package is saved as `exported/Model.mlpackage` unless a different filename is provided. If the conversion runs on macOS 12 or later, a validation step compares the Core ML outputs to the original PyTorch model.
 
-### Quantization
+### Quantization and weight compression
 
-The `--quantize` flag selects the Core ML compute precision used during conversion. Supported values are `float16` (default) and `float32`. When either precision is chosen the exporter serialises the weights as-is and skips any additional post-training quantization steps. This keeps the workflow simple while letting you trade off model size versus numerical accuracy for on-device deployment.
+The `--quantize` flag selects the Core ML compute precision used during conversion. Supported values are `float16` (default) and `float32`. These modes keep the computation in floating point and the exporter skips additional post-training quantization passes.
+
+To reduce the storage footprint without altering compute precision you can chain Core ML Tools' [weight compression utilities](https://coremltools.readme.io/v6.3/docs/compressing-ml-program-weights) via the `--compress-weights` flag:
+
+* `--compress-weights affine` applies affine (linear) quantization to emit 8-bit weights. Combine with `--compression-mode linear` or rely on the default symmetric interpolation.
+* `--compress-weights palettize --compression-nbits 4` replaces constants with lookup tables. The `--compression-mode` switch accepts `uniform`, `kmeans`, or `unique` to control how the palette is constructed.
+* `--compress-weights sparsify` stores sparse tensors compactly. Use `--compression-mode threshold_based --compression-threshold 0.01` or `--compression-mode percentile_based --compression-target-percentile 0.75` depending on whether you want a magnitude or percentile rule.
+
+All compression methods honour `--compression-min-const-size` so you can override the default behaviour and only process weights above a given element count. The exporter forwards these options directly to `coremltools.compression_utils` and records the chosen settings in the Core ML model metadata for downstream tooling.
 
 ### Feature selection
 

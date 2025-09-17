@@ -24,6 +24,10 @@ except ImportError:  # pragma: no cover
     def export(*args, **kwargs):
         raise ImportError("The Core ML exporter requires PyTorch and coremltools to be installed")
 
-from .validate import validate_model_outputs
+try:  # pragma: no cover - optional dependency
+    from .validate import validate_model_outputs
+except ImportError:  # pragma: no cover
+    def validate_model_outputs(*args, **kwargs):
+        raise ImportError("The Core ML exporter requires coremltools to be installed for validation")
 
 __all__ = ["CoreMLConfig", "export", "validate_model_outputs"]

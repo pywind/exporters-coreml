@@ -25,9 +25,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from exporters.coreml.quantization import (  # noqa: E402
     QuantizationConfig,
+    WeightCompressionConfig,
     apply_post_training_quantization,
     quantization_metadata,
     resolve_quantization_config,
+    resolve_weight_compression_config,
 )
 
 
@@ -67,3 +69,59 @@ def test_apply_post_training_quantization_is_noop_without_coremltools(monkeypatc
 def test_invalid_quantization_raises():
     with pytest.raises(ValueError):
         resolve_quantization_config("int8")
+
+
+def test_resolve_weight_compression_none():
+    assert resolve_weight_compression_config(None) is None
+    assert resolve_weight_compression_config("none") is None
+
+
+def test_invalid_weight_compression_method():
+    with pytest.raises(ValueError):
+        WeightCompressionConfig(method="unknown")
+
+
+def test_palettize_requires_valid_nbits():
+    with pytest.raises(ValueError):
+        WeightCompressionConfig(method="palettize", nbits=3)
+
+
+def test_sparsify_percentile_validation():
+    with pytest.raises(ValueError):
+        WeightCompressionConfig(method="sparsify", mode="percentile_based", target_percentile=1.5)
+
+
+def test_weight_compression_metadata_entry():
+    compression = WeightCompressionConfig(method="palettize", nbits=4, mode="kmeans")
+    config = resolve_quantization_config("float16", weight_compression=compression)
+    metadata = quantization_metadata(config)
+    assert metadata["co.huggingface.exporters.weight_compression"].startswith("palettize")
+
+
+def test_apply_weight_compression(monkeypatch):
+    class DummyCompressionUtils:
+        def __init__(self):
+            self.calls = []
+
+        def affine_quantize_weights(self, model, **kwargs):
+            self.calls.append((model, kwargs))
+            return ("compressed", kwargs)
+
+    utils = DummyCompressionUtils()
+    dummy_ct = type(
+        "DummyCT",
+        (),
+        {
+            "precision": type("DummyPrecision", (), {"FLOAT16": "float16", "FLOAT32": "float32"}),
+            "compression_utils": utils,
+        },
+    )()
+    monkeypatch.setattr("exporters.coreml.quantization.ct", dummy_ct, raising=False)
+
+    compression = WeightCompressionConfig(method="affine", mode="linear")
+    config = resolve_quantization_config("float16", weight_compression=compression)
+    model = DummyModel()
+    result = apply_post_training_quantization(model, config)
+
+    assert result[0] == "compressed"
+    assert utils.calls == [(model, {"mode": "linear"})]
